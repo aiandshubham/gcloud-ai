@@ -26,12 +26,65 @@ type GithubRelease struct {
 }
 
 type Asset struct {
-	Name               string `json:"name"`
-	BrowserDownloadURL string `json:"browser_download_url"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
 func getToken() string {
 	return os.Getenv("GITHUB_API_TOKEN")
+}
+
+// githubGet makes an authenticated GET request to the GitHub API
+func githubGet(token, url string, v interface{}) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+// githubDownloadAsset downloads a release asset by ID using the API endpoint
+// with Accept: application/octet-stream — required for private repo assets
+func githubDownloadAsset(token string, assetID int64, dest *os.File) error {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/assets/%d",
+		repoOwner, repoName, assetID)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Accept", "application/octet-stream")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("asset download returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	_, err = io.Copy(dest, resp.Body)
+	return err
 }
 
 // CheckAndUpdate checks GitHub for a newer release once per day.
@@ -42,7 +95,7 @@ func CheckAndUpdate(currentVersion string) {
 
 	token := getToken()
 	if token == "" {
-		// Silent skip — don't block the user just because token isn't set
+		// Silent skip — don't block user if token not set
 		return
 	}
 
@@ -97,21 +150,12 @@ func saveLastCheck() {
 }
 
 func fetchLatestRelease(token string) (*GithubRelease, error) {
-	url := fmt.Sprintf("https://%s@api.github.com/repos/%s/%s/releases/latest",
-		token, repoOwner, repoName)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest",
+		repoOwner, repoName)
 	var release GithubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := githubGet(token, url, &release); err != nil {
 		return nil, err
 	}
-
 	return &release, nil
 }
 
@@ -123,48 +167,62 @@ func isNewer(latest, current string) bool {
 
 func doUpdate(token string, release *GithubRelease) error {
 	assetName := buildAssetName(release.TagName)
-	checksumName := "checksums.txt"
 
-	var assetURL, checksumURL string
+	// Find asset IDs for the binary and checksum file
+	var binaryAssetID, checksumAssetID int64
 	for _, a := range release.Assets {
 		if a.Name == assetName {
-			assetURL = a.BrowserDownloadURL
+			binaryAssetID = a.ID
 		}
-		if a.Name == checksumName {
-			checksumURL = a.BrowserDownloadURL
+		if a.Name == "checksums.txt" {
+			checksumAssetID = a.ID
 		}
 	}
 
-	if assetURL == "" {
+	if binaryAssetID == 0 {
 		return fmt.Errorf("no binary found for %s/%s in release %s",
 			runtime.GOOS, runtime.GOARCH, release.TagName)
 	}
-
-	// Inject token into download URLs
-	assetURL = injectToken(token, assetURL)
-	checksumURL = injectToken(token, checksumURL)
-
-	expectedChecksum, err := fetchExpectedChecksum(checksumURL, assetName)
-	if err != nil {
-		return fmt.Errorf("could not fetch checksum: %v", err)
+	if checksumAssetID == 0 {
+		return fmt.Errorf("checksums.txt not found in release %s", release.TagName)
 	}
 
+	// Download checksum file
+	checksumTmp, err := os.CreateTemp("", "gcloud-ai-checksums-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(checksumTmp.Name())
+
+	if err := githubDownloadAsset(token, checksumAssetID, checksumTmp); err != nil {
+		return fmt.Errorf("could not download checksums: %v", err)
+	}
+	checksumTmp.Close()
+
+	expectedChecksum, err := parseChecksum(checksumTmp.Name(), assetName)
+	if err != nil {
+		return fmt.Errorf("could not parse checksum: %v", err)
+	}
+
+	// Download binary
 	fmt.Printf("   Downloading %s...\n", assetName)
-	tmpFile, err := os.CreateTemp("", "gcloud-ai-update-*")
+	binaryTmp, err := os.CreateTemp("", "gcloud-ai-update-*")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile.Name())
+	defer os.Remove(binaryTmp.Name())
 
-	if err := downloadFile(assetURL, tmpFile); err != nil {
-		return err
+	if err := githubDownloadAsset(token, binaryAssetID, binaryTmp); err != nil {
+		return fmt.Errorf("could not download binary: %v", err)
 	}
-	tmpFile.Close()
+	binaryTmp.Close()
 
-	if err := verifyChecksum(tmpFile.Name(), expectedChecksum); err != nil {
+	// Verify checksum
+	if err := verifyChecksum(binaryTmp.Name(), expectedChecksum); err != nil {
 		return fmt.Errorf("checksum mismatch — aborting update: %v", err)
 	}
 
+	// Replace current binary atomically
 	execPath, err := os.Executable()
 	if err != nil {
 		return err
@@ -174,16 +232,11 @@ func doUpdate(token string, release *GithubRelease) error {
 		return err
 	}
 
-	if err := os.Chmod(tmpFile.Name(), 0755); err != nil {
+	if err := os.Chmod(binaryTmp.Name(), 0755); err != nil {
 		return err
 	}
 
-	return os.Rename(tmpFile.Name(), execPath)
-}
-
-// injectToken converts https://github.com/... to https://TOKEN@github.com/...
-func injectToken(token, rawURL string) string {
-	return strings.Replace(rawURL, "https://", fmt.Sprintf("https://%s@", token), 1)
+	return os.Rename(binaryTmp.Name(), execPath)
 }
 
 func buildAssetName(version string) string {
@@ -197,39 +250,18 @@ func buildAssetName(version string) string {
 		strings.TrimPrefix(version, "v"), goos, goarch, ext)
 }
 
-func fetchExpectedChecksum(checksumURL, assetName string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(checksumURL)
+func parseChecksum(checksumFile, assetName string) (string, error) {
+	data, err := os.ReadFile(checksumFile)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	for _, line := range strings.Split(string(body), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		parts := strings.Fields(line)
 		if len(parts) == 2 && parts[1] == assetName {
 			return parts[0], nil
 		}
 	}
-
 	return "", fmt.Errorf("checksum for %s not found", assetName)
-}
-
-func downloadFile(url string, dest *os.File) error {
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	_, err = io.Copy(dest, resp.Body)
-	return err
 }
 
 func verifyChecksum(filePath, expected string) error {

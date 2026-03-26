@@ -26,7 +26,10 @@ case "$ARCH" in
 esac
 
 echo "🔍 Detecting latest release..."
-LATEST=$(curl -s "https://${GITHUB_API_TOKEN}@api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
+LATEST=$(curl -sf \
+  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+  -H "Accept: application/vnd.github.v3+json" \
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
   | grep '"tag_name"' | cut -d'"' -f4)
 
 if [ -z "$LATEST" ]; then
@@ -36,19 +39,62 @@ fi
 
 VERSION="${LATEST#v}"
 ASSET="${REPO_NAME}_${VERSION}_${OS}_${ARCH}.tar.gz"
-DOWNLOAD_URL="https://${GITHUB_API_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST}/${ASSET}"
-CHECKSUM_URL="https://${GITHUB_API_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST}/checksums.txt"
 
 echo "📦 Downloading ${REPO_NAME} ${LATEST} for ${OS}/${ARCH}..."
 TMP_DIR=$(mktemp -d)
-curl -sL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET}"
+
+# GitHub release assets on private repos require Accept: application/octet-stream
+# and following redirects with -L
+curl -sfL \
+  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+  -H "Accept: application/octet-stream" \
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/$(get_asset_id)" \
+  -o "${TMP_DIR}/${ASSET}"
+
+# Helper: get asset ID from release
+ASSET_ID=$(curl -sf \
+  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+  -H "Accept: application/vnd.github.v3+json" \
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
+  | grep -A1 "\"name\": \"${ASSET}\"" | grep '"id"' | head -1 | grep -o '[0-9]*')
+
+if [ -z "$ASSET_ID" ]; then
+  echo "❌ Could not find asset ${ASSET} in release ${LATEST}"
+  rm -rf "$TMP_DIR"
+  exit 1
+fi
+
+curl -sfL \
+  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+  -H "Accept: application/octet-stream" \
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${ASSET_ID}" \
+  -o "${TMP_DIR}/${ASSET}"
 
 echo "🔐 Verifying checksum..."
-EXPECTED=$(curl -sL "$CHECKSUM_URL" | grep "$ASSET" | awk '{print $1}')
+CHECKSUM_ASSET_ID=$(curl -sf \
+  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+  -H "Accept: application/vnd.github.v3+json" \
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
+  | grep -A1 '"name": "checksums.txt"' | grep '"id"' | head -1 | grep -o '[0-9]*')
+
+CHECKSUM_CONTENT=$(curl -sfL \
+  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+  -H "Accept: application/octet-stream" \
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${CHECKSUM_ASSET_ID}")
+
+EXPECTED=$(echo "$CHECKSUM_CONTENT" | grep "$ASSET" | awk '{print $1}')
 ACTUAL=$(sha256sum "${TMP_DIR}/${ASSET}" 2>/dev/null || shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{print $1}')
+
+if [ -z "$EXPECTED" ]; then
+  echo "❌ Could not find checksum for ${ASSET}"
+  rm -rf "$TMP_DIR"
+  exit 1
+fi
 
 if [ "$EXPECTED" != "$ACTUAL" ]; then
   echo "❌ Checksum mismatch — aborting installation"
+  echo "   Expected: $EXPECTED"
+  echo "   Actual:   $ACTUAL"
   rm -rf "$TMP_DIR"
   exit 1
 fi
@@ -64,7 +110,6 @@ if ! command -v gcloud &>/dev/null; then
   echo ""
   echo "⚠️  gcloud CLI not found."
   echo "   Install it from: https://cloud.google.com/sdk/docs/install"
-  echo "   gcloud-ai requires gcloud to fetch credentials and the API key."
 fi
 
 echo ""
@@ -79,9 +124,8 @@ echo "     Project : ops-dist-mgmt"
 echo "     Secret  : dev-gemini-key"
 echo "     (Ask your admin to grant you roles/secretmanager.secretAccessor if needed)"
 echo ""
-echo "  3. Set your GitHub token for auto-updates:"
-echo "     export GITHUB_API_TOKEN=your_token"
-echo "     echo 'export GITHUB_API_TOKEN=your_token' >> ~/.zshrc   # or ~/.bashrc"
+echo "  3. Keep your token set for auto-updates:"
+echo "     echo 'export GITHUB_API_TOKEN=your_token' >> ~/.zshrc"
 echo ""
 echo "  4. Try it:"
 echo "     gcloud-ai list all my gcp projects"
