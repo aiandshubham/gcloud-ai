@@ -1,9 +1,16 @@
 #!/bin/bash
 set -e
 
-REPO_OWNER="Exabeam"       # 👈 replace with your GitHub org name
+REPO_OWNER="Exabeam"
 REPO_NAME="gcloud-ai"
 INSTALL_DIR="/usr/local/bin"
+
+# Check GITHUB_API_TOKEN is set
+if [ -z "$GITHUB_API_TOKEN" ]; then
+  echo "❌ GITHUB_API_TOKEN is not set."
+  echo "   Export it first: export GITHUB_API_TOKEN=your_token"
+  exit 1
+fi
 
 # Detect OS and arch
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -19,18 +26,18 @@ case "$ARCH" in
 esac
 
 echo "🔍 Detecting latest release..."
-LATEST=$(curl -s "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
+LATEST=$(curl -s "https://${GITHUB_API_TOKEN}@api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
   | grep '"tag_name"' | cut -d'"' -f4)
 
 if [ -z "$LATEST" ]; then
-  echo "❌ Could not fetch latest release. Check your internet connection."
+  echo "❌ Could not fetch latest release. Check your token and internet connection."
   exit 1
 fi
 
 VERSION="${LATEST#v}"
 ASSET="${REPO_NAME}_${VERSION}_${OS}_${ARCH}.tar.gz"
-DOWNLOAD_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST}/${ASSET}"
-CHECKSUM_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST}/checksums.txt"
+DOWNLOAD_URL="https://${GITHUB_API_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST}/${ASSET}"
+CHECKSUM_URL="https://${GITHUB_API_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${LATEST}/checksums.txt"
 
 echo "📦 Downloading ${REPO_NAME} ${LATEST} for ${OS}/${ARCH}..."
 TMP_DIR=$(mktemp -d)
@@ -72,9 +79,9 @@ echo "     Project : ops-dist-mgmt"
 echo "     Secret  : dev-gemini-key"
 echo "     (Ask your admin to grant you roles/secretmanager.secretAccessor if needed)"
 echo ""
-echo "  3. Set your org name for auto-updates:"
-echo "     export GAI_REPO_OWNER=${REPO_OWNER}"
-echo "     echo 'export GAI_REPO_OWNER=${REPO_OWNER}' >> ~/.zshrc   # or ~/.bashrc"
+echo "  3. Set your GitHub token for auto-updates:"
+echo "     export GITHUB_API_TOKEN=your_token"
+echo "     echo 'export GITHUB_API_TOKEN=your_token' >> ~/.zshrc   # or ~/.bashrc"
 echo ""
 echo "  4. Try it:"
 echo "     gcloud-ai list all my gcp projects"

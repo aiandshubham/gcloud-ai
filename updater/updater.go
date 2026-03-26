@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	repoOwnerEnv    = "GAI_REPO_OWNER"   // your org name
-	repoName        = "gcloud-ai"
-	checkIntervalH  = 24                  // check once per day
-	lastCheckFile   = "/.gai/last_update_check"
+	repoOwner      = "Exabeam"
+	repoName       = "gcloud-ai"
+	checkIntervalH = 24
+	lastCheckFile  = "/.gai/last_update_check"
 )
 
 type GithubRelease struct {
@@ -30,18 +30,26 @@ type Asset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
+func getToken() string {
+	return os.Getenv("GITHUB_API_TOKEN")
+}
+
 // CheckAndUpdate checks GitHub for a newer release once per day.
-// If a newer version is found, it prompts the user and updates if confirmed.
 func CheckAndUpdate(currentVersion string) {
 	if !shouldCheck() {
 		return
 	}
 
+	token := getToken()
+	if token == "" {
+		// Silent skip — don't block the user just because token isn't set
+		return
+	}
+
 	saveLastCheck()
 
-	release, err := fetchLatestRelease()
+	release, err := fetchLatestRelease(token)
 	if err != nil {
-		// Silent fail — don't block the user for an update check
 		return
 	}
 
@@ -55,17 +63,17 @@ func CheckAndUpdate(currentVersion string) {
 	var input string
 	fmt.Scanln(&input)
 	if strings.TrimSpace(strings.ToLower(input)) != "y" {
-		fmt.Println("   Skipping update. Run again to be asked tomorrow.")
+		fmt.Println("   Skipping update.")
 		return
 	}
 
-	if err := doUpdate(release); err != nil {
+	if err := doUpdate(token, release); err != nil {
 		fmt.Println("❌ Update failed:", err)
 		return
 	}
 
 	fmt.Println("✅ Updated successfully. Please re-run your command.")
-	os.Exit(0) // exit cleanly so user re-runs with new binary
+	os.Exit(0)
 }
 
 func shouldCheck() bool {
@@ -88,13 +96,9 @@ func saveLastCheck() {
 	os.WriteFile(path, data, 0644)
 }
 
-func fetchLatestRelease() (*GithubRelease, error) {
-	org := os.Getenv(repoOwnerEnv)
-	if org == "" {
-		return nil, fmt.Errorf("%s not set", repoOwnerEnv)
-	}
-
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", org, repoName)
+func fetchLatestRelease(token string) (*GithubRelease, error) {
+	url := fmt.Sprintf("https://%s@api.github.com/repos/%s/%s/releases/latest",
+		token, repoOwner, repoName)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
@@ -111,15 +115,13 @@ func fetchLatestRelease() (*GithubRelease, error) {
 	return &release, nil
 }
 
-// isNewer returns true if latest > current (simple string compare works for semver vX.Y.Z)
 func isNewer(latest, current string) bool {
 	latest = strings.TrimPrefix(latest, "v")
 	current = strings.TrimPrefix(current, "v")
 	return latest != current && latest > current
 }
 
-func doUpdate(release *GithubRelease) error {
-	// Find the right asset for this OS/arch
+func doUpdate(token string, release *GithubRelease) error {
 	assetName := buildAssetName(release.TagName)
 	checksumName := "checksums.txt"
 
@@ -134,16 +136,19 @@ func doUpdate(release *GithubRelease) error {
 	}
 
 	if assetURL == "" {
-		return fmt.Errorf("no binary found for %s/%s in release %s", runtime.GOOS, runtime.GOARCH, release.TagName)
+		return fmt.Errorf("no binary found for %s/%s in release %s",
+			runtime.GOOS, runtime.GOARCH, release.TagName)
 	}
 
-	// Download checksum file first
+	// Inject token into download URLs
+	assetURL = injectToken(token, assetURL)
+	checksumURL = injectToken(token, checksumURL)
+
 	expectedChecksum, err := fetchExpectedChecksum(checksumURL, assetName)
 	if err != nil {
 		return fmt.Errorf("could not fetch checksum: %v", err)
 	}
 
-	// Download the binary to a temp file
 	fmt.Printf("   Downloading %s...\n", assetName)
 	tmpFile, err := os.CreateTemp("", "gcloud-ai-update-*")
 	if err != nil {
@@ -156,12 +161,10 @@ func doUpdate(release *GithubRelease) error {
 	}
 	tmpFile.Close()
 
-	// Verify checksum
 	if err := verifyChecksum(tmpFile.Name(), expectedChecksum); err != nil {
 		return fmt.Errorf("checksum mismatch — aborting update: %v", err)
 	}
 
-	// Replace current binary
 	execPath, err := os.Executable()
 	if err != nil {
 		return err
@@ -175,21 +178,21 @@ func doUpdate(release *GithubRelease) error {
 		return err
 	}
 
-	// Atomic replace: rename temp over existing binary
 	return os.Rename(tmpFile.Name(), execPath)
+}
+
+// injectToken converts https://github.com/... to https://TOKEN@github.com/...
+func injectToken(token, rawURL string) string {
+	return strings.Replace(rawURL, "https://", fmt.Sprintf("https://%s@", token), 1)
 }
 
 func buildAssetName(version string) string {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
-
-	ext := ""
+	ext := ".tar.gz"
 	if goos == "windows" {
 		ext = ".zip"
-	} else {
-		ext = ".tar.gz"
 	}
-
 	return fmt.Sprintf("gcloud-ai_%s_%s_%s%s",
 		strings.TrimPrefix(version, "v"), goos, goarch, ext)
 }
@@ -207,7 +210,6 @@ func fetchExpectedChecksum(checksumURL, assetName string) (string, error) {
 		return "", err
 	}
 
-	// checksums.txt format: "<hash>  <filename>"
 	for _, line := range strings.Split(string(body), "\n") {
 		parts := strings.Fields(line)
 		if len(parts) == 2 && parts[1] == assetName {
