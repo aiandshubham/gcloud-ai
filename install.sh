@@ -1,20 +1,22 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 REPO_OWNER="Exabeam"
 REPO_NAME="gcloud-ai"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR=${GAI_INSTALL_DIR:-/usr/local/bin}
 
 # ── Preflight checks ────────────────────────────────────────────────────────
 
-if [ -z "$GITHUB_API_TOKEN" ]; then
-  echo "❌ GITHUB_API_TOKEN is not set."
-  echo "   Export it first: export GITHUB_API_TOKEN=your_token"
+if ! command -v jq &>/dev/null; then
+  echo "❌ jq is required but not installed."
+  echo "   Install it: brew install jq  (mac) or apt install jq (linux)"
   exit 1
 fi
 
-if ! command -v curl &>/dev/null; then
-  echo "❌ curl is required but not installed."
+GITHUB_API_TOKEN=${GITHUB_API_TOKEN:-}
+if [ -z "${GITHUB_API_TOKEN}" ]; then
+  echo "❌ GITHUB_API_TOKEN must be set in the environment."
+  echo "   Export it first: export GITHUB_API_TOKEN=your_token"
   exit 1
 fi
 
@@ -32,84 +34,78 @@ case "$ARCH" in
     ;;
 esac
 
-# ── Fetch release metadata once ─────────────────────────────────────────────
+# ── Fetch release metadata ───────────────────────────────────────────────────
 
-echo "🔍 Detecting latest release..."
+GAI_VERSION=${GAI_VERSION:-}
+if [ "${GAI_VERSION}" ]; then
+  echo "🔍 Installing version ${GAI_VERSION} of ${REPO_NAME}..."
+  url_tag_path="tags/${GAI_VERSION}"
+else
+  echo "🔍 Installing latest version of ${REPO_NAME}..."
+  url_tag_path="latest"
+fi
 
-RELEASE_JSON=$(curl -sf \
+TMP_DIR=$(mktemp -d)
+TMP_RELEASE=$(mktemp)
+trap 'rm -rf "$TMP_DIR" "$TMP_RELEASE"' EXIT
+
+curl --silent \
   -H "Authorization: token ${GITHUB_API_TOKEN}" \
   -H "Accept: application/vnd.github.v3+json" \
-  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest")
+  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/${url_tag_path}" \
+  -o "$TMP_RELEASE"
 
-if [ -z "$RELEASE_JSON" ]; then
-  echo "❌ Could not fetch release metadata. Check your token and internet connection."
+# Check for API error
+if jq -e '.message' "$TMP_RELEASE" &>/dev/null; then
+  echo "❌ GitHub API error: $(jq -r '.message' "$TMP_RELEASE")"
   exit 1
 fi
 
-LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-
-if [ -z "$LATEST" ]; then
-  echo "❌ Could not parse tag_name from release."
-  exit 1
-fi
-
+LATEST=$(jq -r '.tag_name' "$TMP_RELEASE")
 VERSION="${LATEST#v}"
 ASSET="${REPO_NAME}_${VERSION}_${OS}_${ARCH}.tar.gz"
 
 echo "📦 Downloading ${REPO_NAME} ${LATEST} for ${OS}/${ARCH}..."
 
-# ── Parse asset IDs from the single release JSON ────────────────────────────
-# GitHub API returns assets as an array; we extract the ID for each asset name.
-# The JSON looks like: {"id":12345,"name":"gcloud-ai_1.0.0_darwin_arm64.tar.gz",...}
+# ── Parse asset IDs ──────────────────────────────────────────────────────────
 
-get_asset_id() {
-  local name="$1"
-  echo "$RELEASE_JSON" | grep -B1 "\"name\": \"${name}\"" | grep '"id"' | head -1 | grep -o '[0-9]\+'
-}
+ASSET_ID=$(jq -r ".assets[] | select(.name == \"${ASSET}\").id" "$TMP_RELEASE")
+CHECKSUM_ID=$(jq -r '.assets[] | select(.name == "checksums.txt").id' "$TMP_RELEASE")
 
-ASSET_ID=$(get_asset_id "$ASSET")
-CHECKSUM_ID=$(get_asset_id "checksums.txt")
-
-if [ -z "$ASSET_ID" ]; then
+if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
   echo "❌ Asset '${ASSET}' not found in release ${LATEST}."
   echo "   Available assets:"
-  echo "$RELEASE_JSON" | grep '"name"' | grep -v 'tag_name\|target' | head -20
+  jq -r '.assets[].name' "$TMP_RELEASE"
   exit 1
 fi
 
-if [ -z "$CHECKSUM_ID" ]; then
+if [ -z "$CHECKSUM_ID" ] || [ "$CHECKSUM_ID" = "null" ]; then
   echo "❌ checksums.txt not found in release ${LATEST}."
   exit 1
 fi
 
 # ── Download binary ──────────────────────────────────────────────────────────
 
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT   # always clean up on exit
-
-curl -sfL \
-  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+curl --fail --silent --location \
   -H "Accept: application/octet-stream" \
-  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${ASSET_ID}" \
+  "https://${GITHUB_API_TOKEN}@api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${ASSET_ID}" \
   -o "${TMP_DIR}/${ASSET}"
 
 # ── Verify checksum ──────────────────────────────────────────────────────────
 
 echo "🔐 Verifying checksum..."
 
-CHECKSUM_CONTENT=$(curl -sfL \
-  -H "Authorization: token ${GITHUB_API_TOKEN}" \
+CHECKSUM_CONTENT=$(curl --fail --silent --location \
   -H "Accept: application/octet-stream" \
-  "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${CHECKSUM_ID}")
+  "https://${GITHUB_API_TOKEN}@api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${CHECKSUM_ID}")
 
 EXPECTED=$(echo "$CHECKSUM_CONTENT" | grep "$ASSET" | awk '{print $1}')
 
 if [ -z "$EXPECTED" ]; then
-  echo "❌ Could not find checksum for ${ASSET} in checksums.txt"
+  echo "❌ Could not find checksum for ${ASSET}"
   exit 1
 fi
 
-# sha256sum on Linux, shasum on macOS
 if command -v sha256sum &>/dev/null; then
   ACTUAL=$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{print $1}')
 else
