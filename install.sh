@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_OWNER="Exabeam"
+REPO_OWNER="aiandshubham"
 REPO_NAME="gcloud-ai"
 INSTALL_DIR=${GAI_INSTALL_DIR:-/usr/local/bin}
 
@@ -13,10 +13,8 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-GITHUB_API_TOKEN=${GITHUB_API_TOKEN:-}
-if [ -z "${GITHUB_API_TOKEN}" ]; then
-  echo "❌ GITHUB_API_TOKEN must be set in the environment."
-  echo "   Export it first: export GITHUB_API_TOKEN=your_token"
+if ! command -v curl &>/dev/null; then
+  echo "❌ curl is required but not installed."
   exit 1
 fi
 
@@ -49,13 +47,12 @@ TMP_DIR=$(mktemp -d)
 TMP_RELEASE=$(mktemp)
 trap 'rm -rf "$TMP_DIR" "$TMP_RELEASE"' EXIT
 
+# Public repo — no auth needed
 curl --silent \
-  -H "Authorization: token ${GITHUB_API_TOKEN}" \
   -H "Accept: application/vnd.github.v3+json" \
   "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/${url_tag_path}" \
   -o "$TMP_RELEASE"
 
-# Check for API error
 if jq -e '.message' "$TMP_RELEASE" &>/dev/null; then
   echo "❌ GitHub API error: $(jq -r '.message' "$TMP_RELEASE")"
   exit 1
@@ -84,20 +81,20 @@ if [ -z "$CHECKSUM_ID" ] || [ "$CHECKSUM_ID" = "null" ]; then
   exit 1
 fi
 
-# ── Download binary ──────────────────────────────────────────────────────────
+# ── Download binary — public repo uses direct download URL ───────────────────
+
+DOWNLOAD_URL=$(jq -r ".assets[] | select(.name == \"${ASSET}\").browser_download_url" "$TMP_RELEASE")
+CHECKSUM_URL=$(jq -r '.assets[] | select(.name == "checksums.txt").browser_download_url' "$TMP_RELEASE")
 
 curl --fail --silent --location \
-  -H "Accept: application/octet-stream" \
-  "https://${GITHUB_API_TOKEN}@api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${ASSET_ID}" \
+  "$DOWNLOAD_URL" \
   -o "${TMP_DIR}/${ASSET}"
 
 # ── Verify checksum ──────────────────────────────────────────────────────────
 
 echo "🔐 Verifying checksum..."
 
-CHECKSUM_CONTENT=$(curl --fail --silent --location \
-  -H "Accept: application/octet-stream" \
-  "https://${GITHUB_API_TOKEN}@api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${CHECKSUM_ID}")
+CHECKSUM_CONTENT=$(curl --fail --silent --location "$CHECKSUM_URL")
 
 EXPECTED=$(echo "$CHECKSUM_CONTENT" | grep "$ASSET" | awk '{print $1}')
 
@@ -132,19 +129,24 @@ if ! command -v gcloud &>/dev/null; then
   echo ""
   echo "⚠️  gcloud CLI not found."
   echo "   Install it from: https://cloud.google.com/sdk/docs/install"
-  echo "   gcloud-ai requires gcloud to fetch credentials and the Gemini API key."
+  echo "   gcloud-ai requires gcloud for GCP and Kubernetes commands."
 fi
 
 echo ""
 echo "✅ ${REPO_NAME} ${LATEST} installed successfully!"
 echo ""
 echo "Next steps:"
-echo "  1. Run following bootstrap commands to begin:"
-echo "     gcloud auth login"                                                                           
-echo "     gcloud auth application-default login"
-echo "     gcloud components install gke-gcloud-auth-plugin -q"
-echo "     export USE_GKE_GCLOUD_AUTH_PLUGIN=True"
-echo "     ecp kubeconfig"
+echo "  1. Get a free Gemini API key at: https://aistudio.google.com"
 echo ""
-echo "  2. Try it:"
+echo "  2. Set your API key:"
+echo "     export GEMINI_API_KEY=your_key"
+echo "     echo 'export GEMINI_API_KEY=your_key' >> ~/.zshrc  # make it permanent"
+echo ""
+echo "  3. Try it:"
 echo "     gcloud-ai list all my gcp projects"
+echo ""
+echo "  Optional — create ~/.gai/config.yml for defaults:"
+echo "     gemini_api_key: your_key      # alternative to env var"
+echo "     gemini_model: gemini-2.5-pro  # model override"
+echo "     default_project: my-project   # skip typing project every time"
+echo "     default_region: us-central1   # skip typing region every time"

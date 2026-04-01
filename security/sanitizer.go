@@ -29,7 +29,7 @@ func ValidateCommand(cmd string, tool string) error {
 
 		// check dangerous patterns
 		dangerous := []string{
-			";", "|", ">", "<", "`", "$(", "||",
+			 "|", ">", "<", "`", "$(", "||",
 		}
 
 		for _, d := range dangerous {

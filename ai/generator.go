@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"gcloud-ai/config"
 )
 
 type AIResponse struct {
@@ -34,7 +36,6 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
-// existingKubeContexts returns all context names currently in ~/.kube/config.
 func existingKubeContexts() []string {
 	out, err := exec.Command("kubectl", "config", "get-contexts", "--no-headers", "-o", "name").Output()
 	if err != nil {
@@ -52,11 +53,13 @@ func existingKubeContexts() []string {
 
 func GenerateCommand(prompt string) (string, string, error) {
 
-	// Fetch API key from Secret Manager (or env var override)
 	apiKey, err := GetGeminiAPIKey()
 	if err != nil {
 		return "", "", err
 	}
+
+	// Get model from config (defaults to gemini-2.5-pro)
+	model := config.Load().GeminiModel
 
 	// Build kubeconfig context rule
 	existingContexts := existingKubeContexts()
@@ -67,7 +70,7 @@ func GenerateCommand(prompt string) (string, string, error) {
 - If the user mentions a cluster, ALWAYS start with:
   gcloud container clusters get-credentials <cluster> --region=<region> --project=<project>
 - Then chain the actual kubectl command with &&
-- Example: gcloud container clusters get-credentials prod-jp-gnjf --region=asia-northeast1 --project=exa-cloud-prod && kubectl get pods --all-namespaces`
+- Example: gcloud container clusters get-credentials prod-gnjf --region=asia-northeast1 --project=my-project && kubectl get pods --all-namespaces`
 	} else {
 		k8sContextRule = fmt.Sprintf(`KUBERNETES / GKE RULES:
 - The following kubeconfig contexts already exist on this machine:
@@ -83,7 +86,23 @@ func GenerateCommand(prompt string) (string, string, error) {
 			"  - "+strings.Join(existingContexts, "\n  - "))
 	}
 
-	// Build session context block if a previous command + output exists
+	// Build default context from config
+	cfg := config.Load()
+	defaultContext := ""
+	if cfg.DefaultProject != "" || cfg.DefaultRegion != "" {
+		defaultContext = "USER DEFAULTS (use these when not specified in the prompt):\n"
+		if cfg.DefaultProject != "" {
+			defaultContext += fmt.Sprintf("  - project: %s\n", cfg.DefaultProject)
+		}
+		if cfg.DefaultRegion != "" {
+			defaultContext += fmt.Sprintf("  - region: %s\n", cfg.DefaultRegion)
+		}
+		if cfg.DefaultCluster != "" {
+			defaultContext += fmt.Sprintf("  - cluster: %s\n", cfg.DefaultCluster)
+		}
+	}
+
+	// Build session context block
 	sessionBlock := ""
 	if session := loadSession(); session != nil {
 		output := session.LastOutput
@@ -111,7 +130,9 @@ Return JSON ONLY in this format:
 
 CHAINING RULES:
 - Join dependent steps with && only when step 2 requires step 1 to complete first
-- Do NOT use pipes ( | ), redirects ( > < ), semicolons ( ; ), or subshells ( $() )
+- Do NOT use pipes ( | ), redirects ( > < ) or subshells ( $() )
+
+%s
 
 %s
 
@@ -126,7 +147,7 @@ GENERAL:
 
 Instruction:
 %s
-`, k8sContextRule, sessionBlock, prompt)
+`, k8sContextRule, defaultContext, sessionBlock, prompt)
 
 	reqBody := GeminiRequest{
 		Contents: []struct {
@@ -150,8 +171,8 @@ Instruction:
 	}
 
 	url := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=%s",
-		apiKey,
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
+		model, apiKey,
 	)
 
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
