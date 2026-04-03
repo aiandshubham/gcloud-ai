@@ -1,0 +1,57 @@
+version: 2
+
+project_name: gcloud-ai
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gcloud-ai
+    main: .
+    binary: gcloud-ai
+    ldflags:
+      - -s -w
+      - -X gcloud-ai/internal/version.Version={{.Version}}
+      - -X gcloud-ai/internal/version.Commit={{.Commit}}
+      - -X gcloud-ai/internal/version.BuildDate={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: gcloud-ai
+    name_template: "gcloud-ai_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: ["tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: "{{ .Env.GITHUB_ORG }}"
+    name: gcloud-ai
+  draft: false
+  prerelease: auto
+  name_template: "{{.ProjectName}} {{.Version}}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch

@@ -1,0 +1,11 @@
+blocked_keywords:
+  - delete
+  - rm
+  - destroy
+  - stop
+  - truncate
+  - drop
+  - update
+
+restricted_patterns:
+  - "--force"
