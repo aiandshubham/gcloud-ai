@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"gcloud-ai/setup"
 	"gcloud-ai/ai"
 	"gcloud-ai/executor"
 	"gcloud-ai/internal/version"
@@ -53,6 +54,9 @@ func main() {
 	prompt := strings.Join(os.Args[1:], " ")
 
 	fmt.Println("🤖 Generating command...")
+
+	// Auto-setup check — runs silently, refreshes only if needed
+	setup.EnsureSetup()
 
 	tool, cmd, err := ai.GenerateCommand(prompt)
 	if err != nil {

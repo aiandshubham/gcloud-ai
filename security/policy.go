@@ -3,7 +3,6 @@ package security
 import (
 	"embed"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 
@@ -19,17 +18,8 @@ type Policy struct {
 }
 
 func LoadPolicy() (*Policy, error) {
-	// 1. User override at ~/.gai/policy.yml
-	userPolicy := os.Getenv("HOME") + "/.gai/policy.yml"
-	if data, err := os.ReadFile(userPolicy); err == nil {
-		var p Policy
-		if err := yaml.Unmarshal(data, &p); err != nil {
-			return nil, fmt.Errorf("error parsing %s: %v", userPolicy, err)
-		}
-		return &p, nil
-	}
-
-	// 2. Fall back to embedded default policy bundled in the binary
+	// Always use the embedded policy — no user override allowed
+	// This prevents users from bypassing security restrictions
 	data, err := defaultPolicy.ReadFile("policy.yml")
 	if err != nil {
 		return nil, fmt.Errorf("could not load embedded policy: %v", err)
